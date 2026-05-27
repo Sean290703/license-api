@@ -1,10 +1,9 @@
-import json
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
+import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
@@ -12,7 +11,10 @@ from pydantic import BaseModel
 app = FastAPI()
 
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
-DB_FILE = Path("/tmp/licenses.json")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+TABLE_URL = f"{SUPABASE_URL}/rest/v1/licenses"
 
 
 class CreateLicenseRequest(BaseModel):
@@ -35,20 +37,25 @@ def now_utc():
     return datetime.now(timezone.utc)
 
 
-def load_db():
-    if not DB_FILE.exists():
-        return {"licenses": {}}
+def supabase_headers(prefer=None):
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
 
-    try:
-        with DB_FILE.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"licenses": {}}
+    if prefer:
+        headers["Prefer"] = prefer
+
+    return headers
 
 
-def save_db(db):
-    with DB_FILE.open("w", encoding="utf-8") as f:
-        json.dump(db, f, indent=4)
+def require_config():
+    if not SUPABASE_URL:
+        raise HTTPException(status_code=500, detail="SUPABASE_URL not configured")
+
+    if not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_KEY not configured")
 
 
 def require_admin(x_admin_secret):
@@ -84,12 +91,125 @@ def get_expiration(duration):
     raise HTTPException(status_code=400, detail="Invalid duration")
 
 
+def get_license(license_key):
+    require_config()
+
+    response = requests.get(
+        TABLE_URL,
+        headers=supabase_headers(),
+        params={
+            "license_key": f"eq.{license_key}",
+            "select": "*",
+            "limit": "1",
+        },
+        timeout=30,
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "supabase_get_failed",
+                "status": response.status_code,
+                "body": response.text,
+            },
+        )
+
+    rows = response.json()
+
+    if not rows:
+        return None
+
+    return rows[0]
+
+
+def insert_license(row):
+    require_config()
+
+    response = requests.post(
+        TABLE_URL,
+        headers=supabase_headers(prefer="return=representation"),
+        json=row,
+        timeout=30,
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "supabase_insert_failed",
+                "status": response.status_code,
+                "body": response.text,
+            },
+        )
+
+    return response.json()[0]
+
+
+def update_license(license_key, patch):
+    require_config()
+
+    response = requests.patch(
+        TABLE_URL,
+        headers=supabase_headers(prefer="return=representation"),
+        params={
+            "license_key": f"eq.{license_key}",
+        },
+        json=patch,
+        timeout=30,
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "supabase_update_failed",
+                "status": response.status_code,
+                "body": response.text,
+            },
+        )
+
+    rows = response.json()
+
+    if not rows:
+        return None
+
+    return rows[0]
+
+
+def list_all_licenses():
+    require_config()
+
+    response = requests.get(
+        TABLE_URL,
+        headers=supabase_headers(),
+        params={
+            "select": "*",
+            "order": "created_at.desc",
+        },
+        timeout=30,
+    )
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "supabase_list_failed",
+                "status": response.status_code,
+                "body": response.text,
+            },
+        )
+
+    return response.json()
+
+
 @app.get("/")
 def home():
     return {
         "status": "online",
         "message": "license api running",
         "admin_secret_configured": bool(ADMIN_SECRET),
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_SERVICE_KEY),
     }
 
 
@@ -104,18 +224,18 @@ def create_license(
     x_admin_secret: Optional[str] = Header(default=None),
 ):
     require_admin(x_admin_secret)
+    require_config()
 
     plan, expires_at = get_expiration(data.duration)
-    db = load_db()
 
     license_key = make_license_key()
 
-    while license_key in db["licenses"]:
+    while get_license(license_key) is not None:
         license_key = make_license_key()
 
     created_at = now_utc()
 
-    db["licenses"][license_key] = {
+    row = {
         "license_key": license_key,
         "plan": plan,
         "status": "active",
@@ -127,20 +247,21 @@ def create_license(
         "last_seen_at": None,
     }
 
-    save_db(db)
+    inserted = insert_license(row)
 
     return {
         "ok": True,
-        "license_key": license_key,
-        "plan": plan,
-        "expires_at": expires_at.isoformat() if expires_at else None,
+        "license_key": inserted["license_key"],
+        "plan": inserted["plan"],
+        "expires_at": inserted["expires_at"],
     }
 
 
 @app.post("/verify-license")
 def verify_license(data: VerifyLicenseRequest):
-    db = load_db()
-    license_data = db["licenses"].get(data.license_key)
+    require_config()
+
+    license_data = get_license(data.license_key)
 
     if not license_data:
         return {"valid": False, "reason": "invalid"}
@@ -151,23 +272,33 @@ def verify_license(data: VerifyLicenseRequest):
     expires_at = license_data.get("expires_at")
 
     if expires_at:
-        expires_dt = datetime.fromisoformat(expires_at)
+        expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
 
         if now_utc() > expires_dt:
-            license_data["status"] = "expired"
-            save_db(db)
+            update_license(data.license_key, {"status": "expired"})
             return {"valid": False, "reason": "expired"}
 
     saved_hwid = license_data.get("hwid")
 
     if saved_hwid is None and data.hwid:
-        license_data["hwid"] = data.hwid
+        license_data = update_license(
+            data.license_key,
+            {
+                "hwid": data.hwid,
+                "last_seen_at": now_utc().isoformat(),
+            },
+        )
 
     elif saved_hwid and data.hwid and saved_hwid != data.hwid:
         return {"valid": False, "reason": "hwid_mismatch"}
 
-    license_data["last_seen_at"] = now_utc().isoformat()
-    save_db(db)
+    else:
+        license_data = update_license(
+            data.license_key,
+            {
+                "last_seen_at": now_utc().isoformat(),
+            },
+        )
 
     return {
         "valid": True,
@@ -184,15 +315,14 @@ def revoke_license(
     x_admin_secret: Optional[str] = Header(default=None),
 ):
     require_admin(x_admin_secret)
+    require_config()
 
-    db = load_db()
-    license_data = db["licenses"].get(data.license_key)
+    license_data = get_license(data.license_key)
 
     if not license_data:
         raise HTTPException(status_code=404, detail="License not found")
 
-    license_data["status"] = "revoked"
-    save_db(db)
+    update_license(data.license_key, {"status": "revoked"})
 
     return {"ok": True, "status": "revoked"}
 
@@ -200,4 +330,12 @@ def revoke_license(
 @app.get("/admin/list-licenses")
 def list_licenses(x_admin_secret: Optional[str] = Header(default=None)):
     require_admin(x_admin_secret)
-    return load_db()
+    require_config()
+
+    rows = list_all_licenses()
+
+    return {
+        "licenses": {
+            row["license_key"]: row for row in rows
+        }
+    }
