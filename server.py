@@ -33,6 +33,10 @@ class RevokeLicenseRequest(BaseModel):
     license_key: str
 
 
+class ResetHwidRequest(BaseModel):
+    license_key: str
+
+
 def now_utc():
     return datetime.now(timezone.utc)
 
@@ -325,6 +329,35 @@ def revoke_license(
     update_license(data.license_key, {"status": "revoked"})
 
     return {"ok": True, "status": "revoked"}
+
+
+@app.post("/admin/reset-hwid")
+def reset_hwid(
+    data: ResetHwidRequest,
+    x_admin_secret: Optional[str] = Header(default=None),
+):
+    require_admin(x_admin_secret)
+    require_config()
+
+    license_data = get_license(data.license_key)
+
+    if not license_data:
+        raise HTTPException(status_code=404, detail="License not found")
+
+    updated = update_license(
+        data.license_key,
+        {
+            "hwid": None,
+            "last_seen_at": None,
+        },
+    )
+
+    return {
+        "ok": True,
+        "status": updated["status"],
+        "plan": updated["plan"],
+        "expires_at": updated["expires_at"],
+    }
 
 
 @app.get("/admin/list-licenses")
