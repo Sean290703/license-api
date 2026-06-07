@@ -1,5 +1,7 @@
 import os
 import secrets
+import hashlib
+import hmac
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -21,6 +23,7 @@ class CreateLicenseRequest(BaseModel):
     duration: str
     discord_id: Optional[str] = None
     note: Optional[str] = None
+    idempotency_key: Optional[str] = None
 
 
 class VerifyLicenseRequest(BaseModel):
@@ -74,6 +77,15 @@ def make_license_key():
     raw = secrets.token_urlsafe(32)
     clean = raw.replace("-", "").replace("_", "").upper()
     return "7DYQ-" + clean[:32]
+
+
+def make_idempotent_license_key(idempotency_key):
+    digest = hmac.new(
+        ADMIN_SECRET.encode("utf-8"),
+        idempotency_key.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest().upper()
+    return "7DYQ-" + digest[:32]
 
 
 def get_expiration(duration):
@@ -232,10 +244,20 @@ def create_license(
 
     plan, expires_at = get_expiration(data.duration)
 
-    license_key = make_license_key()
-
-    while get_license(license_key) is not None:
+    if data.idempotency_key:
+        license_key = make_idempotent_license_key(data.idempotency_key)
+        existing = get_license(license_key)
+        if existing is not None:
+            return {
+                "ok": True,
+                "license_key": existing["license_key"],
+                "plan": existing["plan"],
+                "expires_at": existing["expires_at"],
+            }
+    else:
         license_key = make_license_key()
+        while get_license(license_key) is not None:
+            license_key = make_license_key()
 
     created_at = now_utc()
 
@@ -251,7 +273,15 @@ def create_license(
         "last_seen_at": None,
     }
 
-    inserted = insert_license(row)
+    try:
+        inserted = insert_license(row)
+    except HTTPException:
+        if not data.idempotency_key:
+            raise
+        existing = get_license(license_key)
+        if existing is None:
+            raise
+        inserted = existing
 
     return {
         "ok": True,
