@@ -88,23 +88,42 @@ def make_idempotent_license_key(idempotency_key):
     return "7DYQ-" + digest[:32]
 
 
-def get_expiration(duration):
+def get_plan(duration):
     duration = duration.lower().strip()
-    now = now_utc()
 
     if duration in ["1d", "1day", "1_day", "day"]:
-        return "1_day", now + timedelta(days=1)
+        return "1_day"
 
     if duration in ["7d", "1w", "1week", "1_week", "week"]:
-        return "1_week", now + timedelta(days=7)
+        return "1_week"
 
     if duration in ["30d", "1m", "1month", "1_month", "month"]:
-        return "1_month", now + timedelta(days=30)
+        return "1_month"
 
     if duration in ["lifetime", "life", "lt"]:
-        return "lifetime", None
+        return "lifetime"
 
     raise HTTPException(status_code=400, detail="Invalid duration")
+
+
+def get_expiration_for_plan(plan):
+    normalized = str(plan or "").lower().strip().replace(" ", "_").replace("-", "_")
+
+    if normalized in ["1d", "1day", "1_day", "day"]:
+        return now_utc() + timedelta(days=1)
+
+    if normalized in ["7d", "1w", "1week", "1_week", "week"]:
+        return now_utc() + timedelta(days=7)
+
+    if normalized in ["30d", "1m", "1month", "1_month", "month"]:
+        return now_utc() + timedelta(days=30)
+
+    return None
+
+
+def get_expiration(duration):
+    plan = get_plan(duration)
+    return plan, get_expiration_for_plan(plan)
 
 
 def get_license(license_key):
@@ -242,7 +261,7 @@ def create_license(
     require_admin(x_admin_secret)
     require_config()
 
-    plan, expires_at = get_expiration(data.duration)
+    plan = get_plan(data.duration)
 
     if data.idempotency_key:
         license_key = make_idempotent_license_key(data.idempotency_key)
@@ -269,7 +288,8 @@ def create_license(
         "note": data.note,
         "hwid": None,
         "created_at": created_at.isoformat(),
-        "expires_at": expires_at.isoformat() if expires_at else None,
+        # Timed licenses start when the customer first binds the key to a PC.
+        "expires_at": None,
         "last_seen_at": None,
     }
 
@@ -315,12 +335,20 @@ def verify_license(data: VerifyLicenseRequest):
     saved_hwid = license_data.get("hwid")
 
     if saved_hwid is None and data.hwid:
+        patch = {
+            "hwid": data.hwid,
+            "last_seen_at": now_utc().isoformat(),
+        }
+
+        if not expires_at:
+            activated_expires_at = get_expiration_for_plan(license_data.get("plan"))
+
+            if activated_expires_at:
+                patch["expires_at"] = activated_expires_at.isoformat()
+
         license_data = update_license(
             data.license_key,
-            {
-                "hwid": data.hwid,
-                "last_seen_at": now_utc().isoformat(),
-            },
+            patch,
         )
 
     elif saved_hwid and data.hwid and saved_hwid != data.hwid:
